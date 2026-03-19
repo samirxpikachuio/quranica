@@ -13,6 +13,11 @@ jobs:
   deploy:
     runs-on: ubuntu-latest
 
+    # ✅ ADD THIS PART
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -20,7 +25,8 @@ jobs:
       - name: Upload site
         uses: actions/upload-pages-artifact@v3
         with:
-          path: .   # root folder
+          path: .
 
       - name: Deploy
+        id: deploy   # ✅ IMPORTANT (for URL)
         uses: actions/deploy-pages@v4
