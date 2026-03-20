@@ -614,7 +614,49 @@ mark{background:var(--glow);color:var(--accent);font-weight:600;padding:0 2px;bo
 
 <script>
 // ══════════════════════════════════════════════════════════════
-// API CONFIG
+// INDEXED_DB WRAPPER FOR PERSISTENT CACHING
+// ══════════════════════════════════════════════════════════════
+const DB_NAME = 'quran_db';
+const STORE_NAME = 'cache';
+
+function initDB() {
+  return new Promise((resolve, reject) => {
+    const req = indexedDB.open(DB_NAME, 1);
+    req.onupgradeneeded = e => {
+      const db = e.target.result;
+      if (!db.objectStoreNames.contains(STORE_NAME)) db.createObjectStore(STORE_NAME);
+    };
+    req.onsuccess = e => resolve(e.target.result);
+    req.onerror = e => reject(e);
+  });
+}
+
+async function idbGet(key) {
+  try {
+    const db = await initDB();
+    return new Promise((resolve) => {
+      const tx = db.transaction(STORE_NAME, 'readonly');
+      const req = tx.objectStore(STORE_NAME).get(key);
+      req.onsuccess = () => resolve(req.result);
+      req.onerror = () => resolve(null);
+    });
+  } catch (e) { return null; }
+}
+
+async function idbSet(key, val) {
+  try {
+    const db = await initDB();
+    return new Promise((resolve) => {
+      const tx = db.transaction(STORE_NAME, 'readwrite');
+      tx.objectStore(STORE_NAME).put(val, key);
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => resolve();
+    });
+  } catch (e) {}
+}
+
+// ══════════════════════════════════════════════════════════════
+// API CONFIG & RETRY LOGIC
 // ══════════════════════════════════════════════════════════════
 const AQ='https://api.alquran.cloud/v1';
 const JSD='https://cdn.jsdelivr.net/gh/fawazahmed0/quran-api@1/editions';
@@ -628,8 +670,23 @@ const RECITERS={
   4:{name:'Yasser Al Dosari',    code:'Yasser_Ad-Dussary_128kbps'},
   5:{name:'Hani Ar Rifai',       code:'Hani_Rifai_192kbps'},
 };
-function mp3(r,s,a){
+
+function mp3(r,s,a) {
   return `https://everyayah.com/data/${RECITERS[r].code}/${String(s).padStart(3,'0')}${String(a).padStart(3,'0')}.mp3`;
+}
+
+// Resilient Fetch with built-in Retries
+async function fetchWithRetry(url, retries = 3) {
+  for (let i = 0; i < retries; i++) {
+    try {
+      const r = await fetch(url, { cache: 'default' });
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      return await r.json();
+    } catch (e) {
+      if (i === retries - 1) throw e;
+      await new Promise(resolve => setTimeout(resolve, 1000 * (i + 1))); // Exponential backoff
+    }
+  }
 }
 
 // ══════════════════════════════════════════════════════════════
@@ -680,21 +737,52 @@ let S={
   showBengali:true, searchFilter: 'all', showHadithArabic: true,
   bookmarks: (JSON.parse(localStorage.getItem('qbk')||'[]')).map(b => b.type ? b : {...b, type: 'quran'}),
   prayers: JSON.parse(localStorage.getItem('qprayers')) || { city: '', country: '', method: 2 },
-  cache:{ hBooks:null, hChap:{}, hData:{} }, globalQuran:null,
+  globalQuran:null,
   aud:null, playingAyah:null, playingMode:null,
   juzMode:false, currentJuz:null, juzResults:null,
   fromJuz:false,
   hView:'books', hBookSlug:null, hBookName:null, hChapNo:null, hChapName:null
 };
 
-setTimeout(() => fetchFullQuran(), 1000);
+// ══════════════════════════════════════════════════════════════
+// BACKGROUND PRE-FETCHING (Offline & Fast Load Support)
+// ══════════════════════════════════════════════════════════════
+async function prefetchData() {
+  // 1. Prefetch Global Quran for instant offline search
+  await fetchFullQuran();
+  
+  // 2. Prefetch Hadith Books
+  try {
+    const books = await fetchHBooks();
+    if(books && books.length > 0) {
+      // 3. Silently fetch chapters for the first few books to speed up navigation
+      for(let i=0; i<Math.min(books.length, 5); i++) {
+        await fetchHChapters(books[i].bookSlug);
+        await new Promise(r => setTimeout(r, 800)); // Be nice to the API
+      }
+    }
+  } catch(e) {}
+
+  // 4. Silently prefetch Surahs one by one 
+  for(let i=1; i<=114; i++) {
+    const cached = await idbGet(`surah_${i}`);
+    if(!cached) {
+      try {
+        await fetchSurah(i);
+        await new Promise(r => setTimeout(r, 600)); // Delay between requests
+      } catch(e) {}
+    }
+  }
+}
+// Start pre-fetching 3 seconds after the app boots up so it doesn't freeze the UI
+setTimeout(prefetchData, 3000);
+
 
 async function initLocation() {
   if (!S.prayers.city || !S.prayers.country) {
     try {
-      const res = await fetch('https://ipapi.co/json/');
-      const data = await res.json();
-      if(data.city && data.country_name) {
+      const data = await fetchWithRetry('https://ipapi.co/json/', 2);
+      if(data && data.city && data.country_name) {
         S.prayers.city = data.city;
         S.prayers.country = data.country_name;
         localStorage.setItem('qprayers', JSON.stringify(S.prayers));
@@ -865,9 +953,16 @@ function scoreVerse(qWords, qTrigrams, qRaw, v) {
 
 async function fetchFullQuran() {
   if (S.globalQuran) return;
+  
+  // Try to load from IndexedDB first for instant results
+  const cachedFullQuran = await idbGet('full_quran_search');
+  if (cachedFullQuran) {
+    S.globalQuran = cachedFullQuran;
+    return;
+  }
+
   try {
-    const res = await fetch('https://api.alquran.cloud/v1/quran/en.sahih');
-    const data = await res.json();
+    const data = await fetchWithRetry('https://api.alquran.cloud/v1/quran/en.sahih', 3);
     const arr = [];
     if (data && data.data && Array.isArray(data.data.surahs)) {
       data.data.surahs.forEach(sur => { 
@@ -877,6 +972,7 @@ async function fetchFullQuran() {
         const text = v.text || '', tLow = text.toLowerCase();
         return { s: v.s, a: v.a, t: text, tLow: tLow, words: tLow.match(/\w+/g) || [], trigrams: getTrigrams(tLow) };
       });
+      await idbSet('full_quran_search', S.globalQuran);
     }
   } catch(e) { console.error('Quran fetch error', e); }
 }
@@ -932,8 +1028,7 @@ async function runUnifiedSearch(q) {
 
     if (S.searchFilter === 'all' || S.searchFilter === 'hadith') {
       try {
-        const hRes = await fetch(`https://hadithapi.com/public/api/hadiths?apiKey=${HADITH_KEY}&hadithEnglish=${encodeURIComponent(q)}&paginate=15`);
-        const hData = await hRes.json();
+        const hData = await fetchWithRetry(`https://hadithapi.com/public/api/hadiths?apiKey=${HADITH_KEY}&hadithEnglish=${encodeURIComponent(q)}&paginate=15`, 2);
         const hits = hData.hadiths?.data || hData.data || [];
         if(hData.status === 200 && hits.length) {
           const qWords = tokenize(q);
@@ -973,8 +1068,10 @@ async function loadHadithsAndScroll(slug, chapNo, hadithNo, bookName) {
   goTab('hadith');
   S.hBookSlug = slug; S.hBookName = bookName;
   let chapName = `Chapter ${chapNo}`;
-  if(S.cache.hChap[slug]) {
-    const ch = S.cache.hChap[slug].find(c => String(c.chapterNumber) === String(chapNo));
+  
+  const chaps = await idbGet(`h_chaps_${slug}`);
+  if(chaps) {
+    const ch = chaps.find(c => String(c.chapterNumber) === String(chapNo));
     if(ch) chapName = ch.chapterEnglish;
   }
   await loadHadiths(slug, chapNo, chapName);
@@ -1011,33 +1108,41 @@ function renderJuz(){
 }
 
 // ══════════════════════════════════════════════════════════════
-// HADITH
+// HADITH DATA FETCHING WITH CACHE & RETRY
 // ══════════════════════════════════════════════════════════════
 async function fetchHBooks(){
-  if(S.cache.hBooks) return S.cache.hBooks;
-  const r = await fetch(`${HADITH_API}/books?apiKey=${HADITH_KEY}`);
-  if(!r.ok) throw new Error('Failed to fetch Books');
-  const d = await r.json();
+  const cached = await idbGet('h_books');
+  if(cached) return cached;
+  
+  const d = await fetchWithRetry(`${HADITH_API}/books?apiKey=${HADITH_KEY}`, 3);
   if(d.status !== 200) throw new Error(d.message || 'API Error');
   const books = d.books || d.data || [];
-  S.cache.hBooks = books; return books;
+  
+  await idbSet('h_books', books);
+  return books;
 }
 
 async function fetchHChapters(slug){
-  if(S.cache.hChap[slug]) return S.cache.hChap[slug];
-  const r = await fetch(`${HADITH_API}/${slug}/chapters?apiKey=${HADITH_KEY}`);
-  if(!r.ok) throw new Error('Failed to fetch Chapters');
-  const d = await r.json();
+  const cached = await idbGet(`h_chaps_${slug}`);
+  if(cached) return cached;
+  
+  const d = await fetchWithRetry(`${HADITH_API}/${slug}/chapters?apiKey=${HADITH_KEY}`, 3);
   if(d.status !== 200) throw new Error(d.message || 'API Error');
   const chaps = d.chapters?.data || d.chapters || d.data || [];
-  S.cache.hChap[slug] = chaps; return chaps;
+  
+  await idbSet(`h_chaps_${slug}`, chaps);
+  return chaps;
 }
 
 async function fetchHadiths(slug, chapNo, page=1){
-  const r = await fetch(`${HADITH_API}/hadiths?apiKey=${HADITH_KEY}&book=${slug}&chapter=${chapNo}&paginate=50&page=${page}`);
-  if(!r.ok) throw new Error('Failed to fetch Hadiths');
-  const d = await r.json();
+  const cacheKey = `hadith_${slug}_${chapNo}_p${page}`;
+  const cached = await idbGet(cacheKey);
+  if(cached) return cached;
+
+  const d = await fetchWithRetry(`${HADITH_API}/hadiths?apiKey=${HADITH_KEY}&book=${slug}&chapter=${chapNo}&paginate=50&page=${page}`, 3);
   if(d.status !== 200) throw new Error(d.message || 'API Error');
+  
+  await idbSet(cacheKey, d);
   return d;
 }
 
@@ -1190,9 +1295,7 @@ async function renderPrayers() {
   
   try {
     const url = `https://api.aladhan.com/v1/timingsByCity?city=${encodeURIComponent(cty)}&country=${encodeURIComponent(ctry)}&method=${S.prayers.method}`;
-    const res = await fetch(url);
-    if (!res.ok) throw new Error('API Error');
-    const data = await res.json();
+    const data = await fetchWithRetry(url, 2);
     const timings = data.data?.timings || {};
 
     const currentMins = d.getHours() * 60 + d.getMinutes();
@@ -1411,22 +1514,17 @@ function setFs(v){
 }
 
 // ══════════════════════════════════════════════════════════════
-// DATA FETCHING
+// QURAN DATA FETCHING WITH CACHE & RETRY
 // ══════════════════════════════════════════════════════════════
-async function tryFetch(url){
-  const r=await fetch(url,{cache:'default'});
-  if(!r.ok)throw new Error(`HTTP ${r.status}`);
-  return r.json();
-}
 async function fromAlquran(no,edition){
-  const d=await tryFetch(`${AQ}/surah/${no}/${edition}`);
+  const d=await fetchWithRetry(`${AQ}/surah/${no}/${edition}`, 2);
   if(d.code!==200||!d.data?.ayahs)throw new Error('bad');
   return d.data.ayahs.map(a=>a.text);
 }
 async function fromJSD(no,edition){
   for(const url of[`${JSD}/${edition}/${no}.min.json`,`${JSD}/${edition}/${no}.json`]){
     try{
-      const d=await tryFetch(url);
+      const d=await fetchWithRetry(url, 1);
       const arr=d[edition]||d.chapter||d.verses||Object.values(d).find(v=>Array.isArray(v));
       if(arr?.length)return arr.map(v=>v.text||v.t||'');
     }catch{}
@@ -1434,13 +1532,19 @@ async function fromJSD(no,edition){
   throw new Error(`JSD failed: ${edition}/${no}`);
 }
 async function fetchSurah(no){
-  if(S.cache[no])return S.cache[no];
+  const cacheKey = `surah_${no}`;
+  const cached = await idbGet(cacheKey);
+  if (cached) return cached;
+
   const tryAr=()=>fromAlquran(no,'quran-uthmani').catch(()=>fromJSD(no,'quran-uthmani'));
   const tryEn=()=>fromAlquran(no,'en.ahmedali').catch(()=>fromAlquran(no,'en.sahih')).catch(()=>fromJSD(no,'eng-muhammadali'));
   const tryBn=()=>fromAlquran(no,'bn.bengali').catch(()=>fromJSD(no,'ben-muhiuddinkhan'));
+  
   const [ar,en,bn]=await Promise.all([tryAr(),tryEn(),tryBn()]);
-  S.cache[no]={ar,en,bn};
-  return S.cache[no];
+  const data = {ar,en,bn};
+  
+  await idbSet(cacheKey, data);
+  return data;
 }
 
 // ══════════════════════════════════════════════════════════════
@@ -1452,7 +1556,11 @@ async function loadSurah(no){
   $('back-btn').classList.add('show');
   const sm=SURAHS[no-1];
   $('hdr-title').textContent=sm.name;
-  showLoader(`Loading ${sm.name}…`);
+  
+  // If it's already in IndexedDB, don't show the loading spinner for an instant feeling
+  const isCached = await idbGet(`surah_${no}`);
+  if (!isCached) showLoader(`Loading ${sm.name}…`);
+  
   try{
     const d=await fetchSurah(no);
     S.arabic=d.ar;S.english=d.en;S.bengali=d.bn;S.surahData=true;
